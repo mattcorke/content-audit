@@ -23,14 +23,14 @@ st.set_page_config(
 REQUIRED_CONCEPTS = [
     "url",
     "clicks",
-    "conversions",
     "revenue",
-    "sc_impressions",
-    "sc_clicks",
-    "googlebot_crawls",
 ]
 
 OPTIONAL_CONCEPTS = [
+    "conversions",
+    "sc_impressions",
+    "sc_clicks",
+    "googlebot_crawls",
     "content_type",
     "niche",
     "focus_kw",
@@ -38,10 +38,10 @@ OPTIONAL_CONCEPTS = [
 ]
 
 COLUMN_ALIASES = {
-    "url": ["url", "page", "landing page", "address", "page path"],
+    "url": ["url", "page", "landing page", "address", "page path", "post url", "post irl"],
     "clicks": ["clicks", "total clicks", "ga clicks", "sessions"],
     "conversions": ["conversions", "goal completions", "transactions", "conv"],
-    "revenue": ["revenue", "transaction revenue", "total revenue", "rev"],
+    "revenue": ["revenue", "transaction revenue", "total revenue", "rev", "revenue (aud)"],
     "sc_impressions": [
         "search console impressions",
         "sc impressions",
@@ -228,18 +228,16 @@ def find_cannibalization(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
         if has_h1:
             row["H1 A"] = row_a.get("h1", "")
             row["H1 B"] = row_b.get("h1", "")
-        row.update(
-            {
-                "Clicks A": row_a["clicks"],
-                "Clicks B": row_b["clicks"],
-                "Conversions A": row_a["conversions"],
-                "Conversions B": row_b["conversions"],
-                "Revenue A": row_a["revenue"],
-                "Revenue B": row_b["revenue"],
-                "SC Impressions A": row_a["sc_impressions"],
-                "SC Impressions B": row_b["sc_impressions"],
-            }
-        )
+        row["Clicks A"] = row_a["clicks"]
+        row["Clicks B"] = row_b["clicks"]
+        if "conversions" in df.columns and df["conversions"].any():
+            row["Conversions A"] = row_a["conversions"]
+            row["Conversions B"] = row_b["conversions"]
+        row["Revenue A"] = row_a["revenue"]
+        row["Revenue B"] = row_b["revenue"]
+        if "sc_impressions" in df.columns and df["sc_impressions"].any():
+            row["SC Impressions A"] = row_a["sc_impressions"]
+            row["SC Impressions B"] = row_b["sc_impressions"]
         rows.append(row)
 
     if not rows:
@@ -249,7 +247,7 @@ def find_cannibalization(df: pd.DataFrame, threshold: float) -> pd.DataFrame:
 
 
 def find_merge_candidates(
-    df: pd.DataFrame, threshold: float, click_cap: int, impression_cap: int
+    df: pd.DataFrame, threshold: float, click_cap: int, impression_cap: int | None
 ) -> pd.DataFrame:
     """Find similar URLs where BOTH are low-performing — good merge targets."""
     paths = df["_path"].tolist()
@@ -258,94 +256,111 @@ def find_merge_candidates(
     if not pairs:
         return pd.DataFrame()
 
+    has_impressions = df["sc_impressions"].any()
+    has_conversions = df["conversions"].any()
+
     rows = []
     for i, j, score in pairs:
         a = df.iloc[i]
         b = df.iloc[j]
         both_low_clicks = a["clicks"] <= click_cap and b["clicks"] <= click_cap
         both_low_impressions = (
-            a["sc_impressions"] <= impression_cap
+            has_impressions
+            and impression_cap is not None
+            and a["sc_impressions"] <= impression_cap
             and b["sc_impressions"] <= impression_cap
         )
         if both_low_clicks or both_low_impressions:
-            combined_clicks = a["clicks"] + b["clicks"]
-            combined_rev = a["revenue"] + b["revenue"]
-            combined_conversions = a["conversions"] + b["conversions"]
-            rows.append(
-                {
-                    "URL A": a["url"],
-                    "URL B": b["url"],
-                    "Similarity": score,
-                    "Combined Clicks": combined_clicks,
-                    "Combined Conversions": combined_conversions,
-                    "Combined Revenue": combined_rev,
-                    "Clicks A": a["clicks"],
-                    "Clicks B": b["clicks"],
-                    "SC Impressions A": a["sc_impressions"],
-                    "SC Impressions B": b["sc_impressions"],
-                }
-            )
+            row = {
+                "URL A": a["url"],
+                "URL B": b["url"],
+                "Similarity": score,
+                "Combined Clicks": a["clicks"] + b["clicks"],
+                "Combined Revenue": a["revenue"] + b["revenue"],
+                "Clicks A": a["clicks"],
+                "Clicks B": b["clicks"],
+            }
+            if has_conversions:
+                row["Combined Conversions"] = a["conversions"] + b["conversions"]
+            if has_impressions:
+                row["SC Impressions A"] = a["sc_impressions"]
+                row["SC Impressions B"] = b["sc_impressions"]
+            rows.append(row)
 
+    if not rows:
+        return pd.DataFrame()
     return pd.DataFrame(rows).sort_values("Similarity", ascending=False)
 
 
 def find_delete_candidates(
     df: pd.DataFrame,
     max_clicks: int,
-    max_conversions: int,
     max_revenue: float,
-    max_impressions: int,
-    max_crawls: int,
+    max_conversions: int | None = None,
+    max_impressions: int | None = None,
+    max_crawls: int | None = None,
 ) -> pd.DataFrame:
     """Flag pages with universally poor metrics as delete candidates."""
-    mask = (
-        (df["clicks"] <= max_clicks)
-        & (df["conversions"] <= max_conversions)
-        & (df["revenue"] <= max_revenue)
-        & (df["sc_impressions"] <= max_impressions)
-        & (df["googlebot_crawls"] <= max_crawls)
-    )
-    result = df[mask][
-        [
-            "url",
-            "clicks",
-            "conversions",
-            "revenue",
-            "sc_impressions",
-            "sc_clicks",
-            "googlebot_crawls",
-        ]
-    ].copy()
-    result = result.sort_values(
-        ["clicks", "sc_impressions", "revenue"], ascending=True
-    )
+    mask = (df["clicks"] <= max_clicks) & (df["revenue"] <= max_revenue)
+
+    if max_conversions is not None and df["conversions"].any():
+        mask = mask & (df["conversions"] <= max_conversions)
+    if max_impressions is not None and df["sc_impressions"].any():
+        mask = mask & (df["sc_impressions"] <= max_impressions)
+    if max_crawls is not None and df["googlebot_crawls"].any():
+        mask = mask & (df["googlebot_crawls"] <= max_crawls)
+
+    # Build display columns based on what's available
+    display_cols = ["url", "clicks", "revenue"]
+    if df["conversions"].any():
+        display_cols.append("conversions")
+    if df["sc_impressions"].any():
+        display_cols.append("sc_impressions")
+    if df["sc_clicks"].any():
+        display_cols.append("sc_clicks")
+    if df["googlebot_crawls"].any():
+        display_cols.append("googlebot_crawls")
+
+    result = df[mask][display_cols].copy()
+    sort_cols = ["clicks", "revenue"]
+    if "sc_impressions" in display_cols:
+        sort_cols.insert(1, "sc_impressions")
+    result = result.sort_values(sort_cols, ascending=True)
     return result
 
 
-def score_pages(df: pd.DataFrame) -> pd.DataFrame:
+def score_pages(df: pd.DataFrame, mapped_concepts: set[str]) -> pd.DataFrame:
     """Add a composite health score (0-100) to every page."""
     scored = df.copy()
 
     def pct_rank(series):
         return series.rank(pct=True, method="average").fillna(0)
 
-    scored["_click_pct"] = pct_rank(scored["clicks"])
-    scored["_conv_pct"] = pct_rank(scored["conversions"])
-    scored["_rev_pct"] = pct_rank(scored["revenue"])
-    scored["_imp_pct"] = pct_rank(scored["sc_impressions"])
-    scored["_crawl_pct"] = pct_rank(scored["googlebot_crawls"])
+    # Build weights dynamically based on available columns
+    weights: dict[str, float] = {}
+    weights["clicks"] = 30
+    weights["revenue"] = 30
+    if "conversions" in mapped_concepts:
+        weights["conversions"] = 20
+    if "sc_impressions" in mapped_concepts:
+        weights["sc_impressions"] = 15
+    if "googlebot_crawls" in mapped_concepts:
+        weights["googlebot_crawls"] = 10
 
-    scored["health_score"] = (
-        scored["_click_pct"] * 25
-        + scored["_conv_pct"] * 25
-        + scored["_rev_pct"] * 25
-        + scored["_imp_pct"] * 15
-        + scored["_crawl_pct"] * 10
-    ).round(1)
+    # Normalise weights to sum to 100
+    total = sum(weights.values())
+    weights = {k: v / total * 100 for k, v in weights.items()}
 
-    return scored.drop(
-        columns=["_click_pct", "_conv_pct", "_rev_pct", "_imp_pct", "_crawl_pct"]
-    )
+    tmp_cols = []
+    score = pd.Series(0.0, index=scored.index)
+    for col, weight in weights.items():
+        tmp = f"_{col}_pct"
+        scored[tmp] = pct_rank(scored[col])
+        score += scored[tmp] * weight
+        tmp_cols.append(tmp)
+
+    scored["health_score"] = score.round(1)
+    return scored.drop(columns=tmp_cols)
 
 
 # ---------------------------------------------------------------------------
@@ -379,11 +394,21 @@ if uploaded is None:
     st.info("👆 Upload a file to get started.")
     st.stop()
 
+# Header row selection
+header_row = st.number_input(
+    "Header row number",
+    min_value=1,
+    max_value=20,
+    value=1,
+    help="Which row contains the column headers? (1 = first row, 2 = second row, etc.)",
+)
+header_idx = header_row - 1  # pandas uses 0-based indexing
+
 # Load data
 if uploaded.name.endswith(".csv"):
-    raw_df = pd.read_csv(uploaded)
+    raw_df = pd.read_csv(uploaded, header=header_idx)
 else:
-    raw_df = pd.read_excel(uploaded)
+    raw_df = pd.read_excel(uploaded, header=header_idx)
 
 st.success(f"Loaded **{len(raw_df):,}** rows and **{len(raw_df.columns)}** columns.")
 
@@ -415,10 +440,10 @@ for idx, concept in enumerate(REQUIRED_CONCEPTS):
 
 missing = [c for c in REQUIRED_CONCEPTS if c not in col_map]
 if missing:
-    st.warning(f"Please map all columns. Missing: {', '.join(missing)}")
+    st.warning(f"Please map all required columns. Missing: {', '.join(missing)}")
     st.stop()
 
-st.markdown("**Optional columns** (for filtering)")
+st.markdown("**Optional columns** (for enhanced analysis)")
 opt_cols = st.columns(2)
 for idx, concept in enumerate(OPTIONAL_CONCEPTS):
     with opt_cols[idx % 2]:
@@ -443,9 +468,13 @@ df = pd.DataFrame()
 for concept, src_col in col_map.items():
     df[concept] = raw_df[src_col]
 
-# Coerce numerics
-for c in REQUIRED_CONCEPTS[1:]:
-    df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+# Coerce numerics (only mapped columns)
+NUMERIC_CONCEPTS = ["clicks", "conversions", "revenue", "sc_impressions", "sc_clicks", "googlebot_crawls"]
+for c in NUMERIC_CONCEPTS:
+    if c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0)
+    else:
+        df[c] = 0  # default to 0 for unmapped numeric columns
 
 df["url"] = df["url"].astype(str)
 df["_path"] = df["url"].apply(extract_path)
@@ -508,15 +537,23 @@ if rows_after < rows_before:
 st.divider()
 st.subheader("📊 Overview")
 
-m1, m2, m3, m4, m5 = st.columns(5)
-m1.metric("Total Pages", f"{len(df):,}")
-m2.metric("Total Clicks", f"{int(df['clicks'].sum()):,}")
-m3.metric("Total Conversions", f"{int(df['conversions'].sum()):,}")
-m4.metric("Total Revenue", f"${df['revenue'].sum():,.2f}")
-m5.metric("Zero-Click Pages", f"{(df['clicks'] == 0).sum():,}")
+has_conversions = "conversions" in col_map
+has_sc_impressions = "sc_impressions" in col_map
+has_sc_clicks = "sc_clicks" in col_map
+has_googlebot = "googlebot_crawls" in col_map
+
+metric_cols = st.columns(3 + int(has_conversions) + int(has_sc_impressions))
+idx = 0
+metric_cols[idx].metric("Total Pages", f"{len(df):,}"); idx += 1
+metric_cols[idx].metric("Total Clicks", f"{int(df['clicks'].sum()):,}"); idx += 1
+if has_conversions:
+    metric_cols[idx].metric("Total Conversions", f"{int(df['conversions'].sum()):,}"); idx += 1
+metric_cols[idx].metric("Total Revenue", f"${df['revenue'].sum():,.2f}"); idx += 1
+if has_sc_impressions:
+    metric_cols[idx].metric("Zero-Impression Pages", f"{(df['sc_impressions'] == 0).sum():,}"); idx += 1
 
 # Pareto chart
-scored_df = score_pages(df)
+scored_df = score_pages(df, set(col_map.keys()))
 
 fig_pareto = go.Figure()
 sorted_by_rev = scored_df.sort_values("revenue", ascending=False).reset_index(
@@ -603,16 +640,21 @@ with tab_merge:
         "Similar pages where **both are underperforming** — consolidating them "
         "into a single stronger page could improve rankings."
     )
-    c1, c2, c3 = st.columns(3)
+    if has_sc_impressions:
+        c1, c2, c3 = st.columns(3)
+    else:
+        c1, c2 = st.columns(2)
     merge_thresh = c1.slider(
         "Similarity threshold", 0.3, 1.0, 0.55, 0.05, key="merge_thresh"
     )
     merge_click_cap = c2.number_input(
         "Max clicks (each page)", value=50, min_value=0, key="merge_clicks"
     )
-    merge_imp_cap = c3.number_input(
-        "Max impressions (each page)", value=500, min_value=0, key="merge_imp"
-    )
+    merge_imp_cap = None
+    if has_sc_impressions:
+        merge_imp_cap = c3.number_input(
+            "Max impressions (each page)", value=500, min_value=0, key="merge_imp"
+        )
 
     with st.spinner("Finding merge candidates…"):
         merge_df = find_merge_candidates(
@@ -628,28 +670,41 @@ with tab_merge:
 # --- Delete ---
 with tab_delete:
     st.markdown(
-        "Pages failing across **all metrics** — low clicks, no conversions, "
-        "no revenue, low impressions, and low crawl activity. Strong candidates "
+        "Pages failing across **all available metrics** — strong candidates "
         "for removal or noindex."
     )
-    d1, d2, d3 = st.columns(3)
+    d1, d2 = st.columns(2)
     del_clicks = d1.number_input("Max clicks", value=5, min_value=0, key="del_clicks")
-    del_conv = d2.number_input(
-        "Max conversions", value=0, min_value=0, key="del_conv"
-    )
-    del_rev = d3.number_input(
+    del_rev = d2.number_input(
         "Max revenue ($)", value=0.0, min_value=0.0, key="del_rev"
     )
-    d4, d5 = st.columns(2)
-    del_imp = d4.number_input(
-        "Max SC impressions", value=100, min_value=0, key="del_imp"
-    )
-    del_crawl = d5.number_input(
-        "Max GoogleBot crawls", value=2, min_value=0, key="del_crawl"
-    )
+
+    del_conv = None
+    del_imp = None
+    del_crawl = None
+    extra_cols = [c for c in [
+        ("conversions", has_conversions),
+        ("sc_impressions", has_sc_impressions),
+        ("googlebot_crawls", has_googlebot),
+    ] if c[1]]
+    if extra_cols:
+        extra_st_cols = st.columns(len(extra_cols))
+        for i, (concept, _) in enumerate(extra_cols):
+            if concept == "conversions":
+                del_conv = extra_st_cols[i].number_input(
+                    "Max conversions", value=0, min_value=0, key="del_conv"
+                )
+            elif concept == "sc_impressions":
+                del_imp = extra_st_cols[i].number_input(
+                    "Max SC impressions", value=100, min_value=0, key="del_imp"
+                )
+            elif concept == "googlebot_crawls":
+                del_crawl = extra_st_cols[i].number_input(
+                    "Max GoogleBot crawls", value=2, min_value=0, key="del_crawl"
+                )
 
     delete_df = find_delete_candidates(
-        df, del_clicks, del_conv, del_rev, del_imp, del_crawl
+        df, del_clicks, del_rev, del_conv, del_imp, del_crawl
     )
 
     if delete_df.empty:
@@ -661,36 +716,36 @@ with tab_delete:
         )
 
         # Impact summary
-        ic1, ic2, ic3 = st.columns(3)
-        ic1.metric(
+        n_impact = 2 + int(has_googlebot)
+        impact_cols = st.columns(n_impact)
+        impact_cols[0].metric(
             "Total clicks on these pages", f"{int(delete_df['clicks'].sum()):,}"
         )
-        ic2.metric(
+        impact_cols[1].metric(
             "Total revenue on these pages",
             f"${delete_df['revenue'].sum():,.2f}",
         )
-        ic3.metric(
-            "Avg crawl budget used",
-            f"{delete_df['googlebot_crawls'].mean():.1f} crawls/page",
-        )
+        if has_googlebot:
+            impact_cols[2].metric(
+                "Avg crawl budget used",
+                f"{delete_df['googlebot_crawls'].mean():.1f} crawls/page",
+            )
 
         st.dataframe(delete_df, use_container_width=True, height=500)
 
 # --- All Pages ---
 with tab_all:
     st.markdown("All pages with **health scores**. Sort by any column.")
-    display_df = scored_df[
-        [
-            "url",
-            "health_score",
-            "clicks",
-            "conversions",
-            "revenue",
-            "sc_impressions",
-            "sc_clicks",
-            "googlebot_crawls",
-        ]
-    ].sort_values("health_score", ascending=True)
+    all_page_cols = ["url", "health_score", "clicks", "revenue"]
+    if has_conversions:
+        all_page_cols.append("conversions")
+    if has_sc_impressions:
+        all_page_cols.append("sc_impressions")
+    if has_sc_clicks:
+        all_page_cols.append("sc_clicks")
+    if has_googlebot:
+        all_page_cols.append("googlebot_crawls")
+    display_df = scored_df[all_page_cols].sort_values("health_score", ascending=True)
     st.dataframe(display_df, use_container_width=True, height=600)
 
 # --- Export ---
