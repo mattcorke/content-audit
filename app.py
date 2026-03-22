@@ -140,8 +140,22 @@ def slugify_path(path: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+def strip_niche_prefix(path: str) -> str:
+    """Remove the first directory segment (niche) from a URL path.
+
+    e.g. "/travel-insurance/best-policies" -> "/best-policies"
+         "/credit-cards/compare"          -> "/compare"
+         "/simple-page"                   -> "/simple-page" (no change)
+    """
+    segments = path.strip("/").split("/")
+    if len(segments) > 1:
+        return "/" + "/".join(segments[1:])
+    return path
+
+
 def compute_similarity_matrix(paths: list[str], threshold: float) -> list[tuple]:
     """Return pairs of (i, j, score) where cosine similarity >= threshold."""
+    paths = [strip_niche_prefix(p) for p in paths]
     slugs = [slugify_path(p) for p in paths]
 
     # Filter out empty slugs
