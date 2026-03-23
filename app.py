@@ -811,24 +811,30 @@ with tab_cannibal:
                 count_msg += f" ({hidden_count} dismissed pairs hidden)"
             st.warning(count_msg)
 
-            # Add dismiss checkbox column
-            cannibal_df.insert(0, "Dismiss", False)
+            # Add action checkbox columns
+            cannibal_df.insert(0, "Deep Dive", False)
+            cannibal_df.insert(1, "Dismiss", False)
             edited = st.data_editor(
                 cannibal_df,
                 use_container_width=True,
                 height=500,
                 key="cannibal_editor",
-                column_config={"Dismiss": st.column_config.CheckboxColumn("Dismiss", default=False)},
+                column_config={
+                    "Deep Dive": st.column_config.CheckboxColumn("🔬", default=False, help="Tick to deep dive"),
+                    "Dismiss": st.column_config.CheckboxColumn("🗑️", default=False, help="Tick to dismiss"),
+                },
             )
 
+            btn_col1, btn_col2 = st.columns(2)
             to_dismiss = edited[edited["Dismiss"] == True]
             if len(to_dismiss) > 0:
-                if st.button(f"Dismiss {len(to_dismiss)} selected pair(s)", type="primary"):
-                    new_dismissed = dismissed.copy()
-                    for _, row in to_dismiss.iterrows():
-                        new_dismissed.add(make_pair_key(row["URL A"], row["URL B"]))
-                    save_dismissed_pairs(new_dismissed)
-                    st.rerun()
+                with btn_col1:
+                    if st.button(f"Dismiss {len(to_dismiss)} selected pair(s)", type="primary"):
+                        new_dismissed = dismissed.copy()
+                        for _, row in to_dismiss.iterrows():
+                            new_dismissed.add(make_pair_key(row["URL A"], row["URL B"]))
+                        save_dismissed_pairs(new_dismissed)
+                        st.rerun()
 
         # Restore dismissed pairs button
         if hidden_count > 0:
@@ -837,115 +843,100 @@ with tab_cannibal:
                 st.rerun()
 
     # --- Deep Dive ---
-    st.divider()
-    st.subheader("🔬 Deep Dive")
-    st.markdown(
-        "Select a pair to fetch both pages and compare their **actual content** "
-        "— body text similarity, shared keywords, and overlapping headings."
-    )
+    to_dive = edited[edited["Deep Dive"] == True] if not cannibal_df.empty and "Deep Dive" in edited.columns else pd.DataFrame()
 
-    if not cannibal_df.empty:
-        # Build pair options from the (possibly filtered) cannibal_df
-        display_cannibal = cannibal_df.drop(columns=["Dismiss"], errors="ignore")
-        pair_labels = [
-            f"{row['URL A']}  ↔  {row['URL B']}  (score: {row['Score']})"
-            for _, row in display_cannibal.iterrows()
-        ]
-        selected_pair = st.selectbox("Select a pair", pair_labels, key="deep_dive_pair")
+    if not to_dive.empty:
+        st.divider()
+        st.subheader(f"🔬 Deep Dive — {len(to_dive)} pair(s)")
 
-        if st.button("Fetch & Compare", type="primary", key="deep_dive_btn"):
-            pair_idx = pair_labels.index(selected_pair)
-            pair_row = display_cannibal.iloc[pair_idx]
+        for pair_num, (_, pair_row) in enumerate(to_dive.iterrows()):
             url_a, url_b = pair_row["URL A"], pair_row["URL B"]
 
-            col_a, col_b = st.columns(2)
+            with st.expander(f"**{url_a}** ↔ **{url_b}** (score: {pair_row['Score']})", expanded=True):
+                with st.spinner(f"Fetching pages…"):
+                    page_a = fetch_page(url_a)
+                    page_b = fetch_page(url_b)
 
-            with st.spinner(f"Fetching pages…"):
-                page_a = fetch_page(url_a)
-                page_b = fetch_page(url_b)
+                # Check for errors
+                if "error" in page_a:
+                    st.error(f"Failed to fetch **{url_a}**: {page_a['error']}")
+                if "error" in page_b:
+                    st.error(f"Failed to fetch **{url_b}**: {page_b['error']}")
 
-            # Check for errors
-            if "error" in page_a:
-                st.error(f"Failed to fetch **{url_a}**: {page_a['error']}")
-            if "error" in page_b:
-                st.error(f"Failed to fetch **{url_b}**: {page_b['error']}")
+                if "error" not in page_a and "error" not in page_b:
+                    comparison = compare_pages(page_a, page_b)
 
-            if "error" not in page_a and "error" not in page_b:
-                comparison = compare_pages(page_a, page_b)
+                    # Similarity scores
+                    s1, s2 = st.columns(2)
+                    s1.metric("Content Similarity", f"{comparison['content_similarity']:.0%}")
+                    s2.metric("Title Similarity", f"{comparison['title_similarity']:.0%}")
 
-                # Similarity scores
-                s1, s2 = st.columns(2)
-                s1.metric("Content Similarity", f"{comparison['content_similarity']:.0%}")
-                s2.metric("Title Similarity", f"{comparison['title_similarity']:.0%}")
+                    # Side-by-side page details
+                    col_a, col_b = st.columns(2)
+                    with col_a:
+                        st.markdown(f"**Page A:** `{url_a}`")
+                        st.markdown(f"**Title:** {page_a['title']}")
+                        st.markdown(f"**Meta:** {page_a['meta_desc'][:200]}")
+                        st.markdown(f"**Word count:** {page_a['word_count']:,}")
+                        if page_a["headings"]["h1"]:
+                            st.markdown(f"**H1:** {', '.join(page_a['headings']['h1'])}")
+                        if page_a["headings"]["h2"]:
+                            st.markdown("**H2s:**")
+                            for h in page_a["headings"]["h2"]:
+                                st.markdown(f"- {h}")
 
-                # Side-by-side page details
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    st.markdown(f"**Page A:** `{url_a}`")
-                    st.markdown(f"**Title:** {page_a['title']}")
-                    st.markdown(f"**Meta:** {page_a['meta_desc'][:200]}")
-                    st.markdown(f"**Word count:** {page_a['word_count']:,}")
-                    if page_a["headings"]["h1"]:
-                        st.markdown(f"**H1:** {', '.join(page_a['headings']['h1'])}")
-                    if page_a["headings"]["h2"]:
-                        st.markdown("**H2s:**")
-                        for h in page_a["headings"]["h2"]:
-                            st.markdown(f"- {h}")
+                    with col_b:
+                        st.markdown(f"**Page B:** `{url_b}`")
+                        st.markdown(f"**Title:** {page_b['title']}")
+                        st.markdown(f"**Meta:** {page_b['meta_desc'][:200]}")
+                        st.markdown(f"**Word count:** {page_b['word_count']:,}")
+                        if page_b["headings"]["h1"]:
+                            st.markdown(f"**H1:** {', '.join(page_b['headings']['h1'])}")
+                        if page_b["headings"]["h2"]:
+                            st.markdown("**H2s:**")
+                            for h in page_b["headings"]["h2"]:
+                                st.markdown(f"- {h}")
 
-                with col_b:
-                    st.markdown(f"**Page B:** `{url_b}`")
-                    st.markdown(f"**Title:** {page_b['title']}")
-                    st.markdown(f"**Meta:** {page_b['meta_desc'][:200]}")
-                    st.markdown(f"**Word count:** {page_b['word_count']:,}")
-                    if page_b["headings"]["h1"]:
-                        st.markdown(f"**H1:** {', '.join(page_b['headings']['h1'])}")
-                    if page_b["headings"]["h2"]:
-                        st.markdown("**H2s:**")
-                        for h in page_b["headings"]["h2"]:
-                            st.markdown(f"- {h}")
+                    # Shared analysis
+                    st.divider()
+                    if comparison["shared_keywords"]:
+                        st.markdown(
+                            f"**Shared top keywords ({len(comparison['shared_keywords'])}):** "
+                            + ", ".join(sorted(comparison["shared_keywords"]))
+                        )
+                    else:
+                        st.markdown("**Shared top keywords:** None")
 
-                # Shared analysis
-                st.divider()
-                if comparison["shared_keywords"]:
-                    st.markdown(
-                        f"**Shared top keywords ({len(comparison['shared_keywords'])}):** "
-                        + ", ".join(sorted(comparison["shared_keywords"]))
-                    )
-                else:
-                    st.markdown("**Shared top keywords:** None")
+                    if comparison["shared_h2_exact"]:
+                        st.markdown(
+                            f"**Identical H2 headings ({len(comparison['shared_h2_exact'])}):** "
+                            + ", ".join(sorted(comparison["shared_h2_exact"]))
+                        )
+                    if comparison["shared_h2_fuzzy"]:
+                        st.markdown(
+                            f"**Similar H2 headings ({len(comparison['shared_h2_fuzzy'])}):**"
+                        )
+                        for ha, hb in comparison["shared_h2_fuzzy"]:
+                            st.markdown(f'- "{ha}" ↔ "{hb}"')
 
-                if comparison["shared_h2_exact"]:
-                    st.markdown(
-                        f"**Identical H2 headings ({len(comparison['shared_h2_exact'])}):** "
-                        + ", ".join(sorted(comparison["shared_h2_exact"]))
-                    )
-                if comparison["shared_h2_fuzzy"]:
-                    st.markdown(
-                        f"**Similar H2 headings ({len(comparison['shared_h2_fuzzy'])}):**"
-                    )
-                    for ha, hb in comparison["shared_h2_fuzzy"]:
-                        st.markdown(f'- "{ha}" ↔ "{hb}"')
-
-                # Verdict
-                st.divider()
-                cs = comparison["content_similarity"]
-                if cs >= 0.5:
-                    st.error(
-                        f"**High content overlap ({cs:.0%})** — these pages are likely "
-                        "cannibalizing each other. Consider merging or differentiating."
-                    )
-                elif cs >= 0.3:
-                    st.warning(
-                        f"**Moderate content overlap ({cs:.0%})** — some shared topics. "
-                        "Review the shared keywords and headings to decide."
-                    )
-                else:
-                    st.success(
-                        f"**Low content overlap ({cs:.0%})** — probably a false positive. "
-                        "Consider dismissing this pair."
-                    )
-    else:
-        st.info("No cannibalization pairs to deep dive into.")
+                    # Verdict
+                    st.divider()
+                    cs = comparison["content_similarity"]
+                    if cs >= 0.5:
+                        st.error(
+                            f"**High content overlap ({cs:.0%})** — these pages are likely "
+                            "cannibalizing each other. Consider merging or differentiating."
+                        )
+                    elif cs >= 0.3:
+                        st.warning(
+                            f"**Moderate content overlap ({cs:.0%})** — some shared topics. "
+                            "Review the shared keywords and headings to decide."
+                        )
+                    else:
+                        st.success(
+                            f"**Low content overlap ({cs:.0%})** — probably a false positive. "
+                            "Consider dismissing this pair."
+                        )
 
 # --- Merge ---
 with tab_merge:
