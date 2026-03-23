@@ -52,6 +52,12 @@ FETCH_HEADERS = {
 }
 STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"}
 
+# Boilerplate phrases to strip from body text before comparison.
+# These appear on many pages and inflate similarity scores.
+BOILERPLATE_PHRASES = [
+    r"get rewarded \$?\$?\d*\s*for switching with finder rewards",
+]
+
 
 @st.cache_data(show_spinner=False, ttl=3600)
 def fetch_page(url: str) -> dict:
@@ -82,6 +88,10 @@ def fetch_page(url: str) -> dict:
     body_text = body_el.get_text(separator=" ", strip=True) if body_el else ""
     # Collapse whitespace
     body_text = re.sub(r"\s+", " ", body_text).strip()
+
+    # Strip boilerplate phrases
+    for pattern in BOILERPLATE_PHRASES:
+        body_text = re.sub(pattern, "", body_text, flags=re.IGNORECASE)
 
     words = re.findall(r"[a-zA-Z]{3,}", body_text.lower())
     word_count = len(words)
