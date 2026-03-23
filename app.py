@@ -80,11 +80,17 @@ def fetch_page(url: str) -> dict:
     if meta_tag and meta_tag.get("content"):
         meta_desc = meta_tag["content"].strip()
 
+    # Target the main content area, falling back progressively
+    body_el = (
+        soup.find("div", id="main")
+        or soup.find("main")
+        or soup.find("article")
+        or soup.body
+    )
+
     headings = {}
     for level in ("h1", "h2", "h3"):
-        headings[level] = [h.get_text(strip=True) for h in soup.find_all(level)]
-
-    body_el = soup.find("main") or soup.find("article") or soup.body
+        headings[level] = [h.get_text(strip=True) for h in body_el.find_all(level)] if body_el else []
     body_text = body_el.get_text(separator=" ", strip=True) if body_el else ""
     # Collapse whitespace
     body_text = re.sub(r"\s+", " ", body_text).strip()
