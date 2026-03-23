@@ -2,9 +2,12 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 from urllib.parse import urlparse
+from collections import Counter
 import re
 import json
 from pathlib import Path
+import requests
+from bs4 import BeautifulSoup
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz
@@ -38,6 +41,110 @@ def save_dismissed_pairs(pairs: set[tuple[str, str]]) -> None:
 def make_pair_key(url_a: str, url_b: str) -> tuple[str, str]:
     """Canonical key for a URL pair (sorted so order doesn't matter)."""
     return tuple(sorted([url_a, url_b]))
+
+
+# ---------------------------------------------------------------------------
+# Page content fetching & comparison
+# ---------------------------------------------------------------------------
+
+FETCH_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (compatible; ContentAuditBot/1.0)",
+}
+STRIP_TAGS = {"script", "style", "nav", "footer", "header", "aside", "noscript", "iframe"}
+
+
+@st.cache_data(show_spinner=False, ttl=3600)
+def fetch_page(url: str) -> dict:
+    """Fetch a URL and extract key content elements."""
+    try:
+        resp = requests.get(url, headers=FETCH_HEADERS, timeout=15)
+        resp.raise_for_status()
+    except requests.RequestException as e:
+        return {"error": str(e)}
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+
+    # Remove boilerplate tags
+    for tag in soup.find_all(STRIP_TAGS):
+        tag.decompose()
+
+    title = soup.title.get_text(strip=True) if soup.title else ""
+    meta_desc = ""
+    meta_tag = soup.find("meta", attrs={"name": "description"})
+    if meta_tag and meta_tag.get("content"):
+        meta_desc = meta_tag["content"].strip()
+
+    headings = {}
+    for level in ("h1", "h2", "h3"):
+        headings[level] = [h.get_text(strip=True) for h in soup.find_all(level)]
+
+    body_el = soup.find("main") or soup.find("article") or soup.body
+    body_text = body_el.get_text(separator=" ", strip=True) if body_el else ""
+    # Collapse whitespace
+    body_text = re.sub(r"\s+", " ", body_text).strip()
+
+    words = re.findall(r"[a-zA-Z]{3,}", body_text.lower())
+    word_count = len(words)
+
+    # Top keyword phrases (unigrams)
+    stop = {"the", "and", "for", "that", "this", "with", "are", "from", "was",
+            "were", "been", "have", "has", "had", "not", "but", "can", "will",
+            "your", "you", "our", "all", "more", "about", "also", "into", "than",
+            "its", "which", "their", "them", "other", "some", "what", "when",
+            "how", "who", "may", "most", "any", "each", "only", "over", "such"}
+    filtered = [w for w in words if w not in stop and len(w) > 2]
+    top_keywords = Counter(filtered).most_common(20)
+
+    return {
+        "title": title,
+        "meta_desc": meta_desc,
+        "headings": headings,
+        "body_text": body_text,
+        "word_count": word_count,
+        "top_keywords": top_keywords,
+    }
+
+
+def compare_pages(page_a: dict, page_b: dict) -> dict:
+    """Compare two fetched pages and return similarity metrics."""
+    if "error" in page_a or "error" in page_b:
+        return {"error": True}
+
+    # Body text cosine similarity
+    texts = [page_a["body_text"], page_b["body_text"]]
+    if all(t.strip() for t in texts):
+        vec = TfidfVectorizer(stop_words="english", max_features=5000)
+        tfidf = vec.fit_transform(texts)
+        content_sim = cosine_similarity(tfidf)[0][1]
+    else:
+        content_sim = 0.0
+
+    # Title similarity
+    title_sim = fuzz.token_sort_ratio(page_a["title"], page_b["title"]) / 100
+
+    # Shared keywords
+    kw_a = {kw for kw, _ in page_a["top_keywords"]}
+    kw_b = {kw for kw, _ in page_b["top_keywords"]}
+    shared_kw = kw_a & kw_b
+
+    # Shared headings (H2s — most indicative of subtopic overlap)
+    h2_a = {h.lower().strip() for h in page_a["headings"].get("h2", [])}
+    h2_b = {h.lower().strip() for h in page_b["headings"].get("h2", [])}
+    shared_h2 = h2_a & h2_b
+    # Fuzzy H2 matches
+    fuzzy_h2 = set()
+    for ha in h2_a - shared_h2:
+        for hb in h2_b - shared_h2:
+            if fuzz.token_sort_ratio(ha, hb) >= 75:
+                fuzzy_h2.add((ha, hb))
+
+    return {
+        "content_similarity": round(content_sim, 3),
+        "title_similarity": round(title_sim, 3),
+        "shared_keywords": shared_kw,
+        "shared_h2_exact": shared_h2,
+        "shared_h2_fuzzy": fuzzy_h2,
+    }
 
 st.set_page_config(
     page_title="Content Audit Tool",
@@ -718,6 +825,117 @@ with tab_cannibal:
             if st.button(f"Restore {hidden_count} dismissed pair(s)"):
                 save_dismissed_pairs(set())
                 st.rerun()
+
+    # --- Deep Dive ---
+    st.divider()
+    st.subheader("🔬 Deep Dive")
+    st.markdown(
+        "Select a pair to fetch both pages and compare their **actual content** "
+        "— body text similarity, shared keywords, and overlapping headings."
+    )
+
+    if not cannibal_df.empty:
+        # Build pair options from the (possibly filtered) cannibal_df
+        display_cannibal = cannibal_df.drop(columns=["Dismiss"], errors="ignore")
+        pair_labels = [
+            f"{row['URL A']}  ↔  {row['URL B']}  (score: {row['Score']})"
+            for _, row in display_cannibal.iterrows()
+        ]
+        selected_pair = st.selectbox("Select a pair", pair_labels, key="deep_dive_pair")
+
+        if st.button("Fetch & Compare", type="primary", key="deep_dive_btn"):
+            pair_idx = pair_labels.index(selected_pair)
+            pair_row = display_cannibal.iloc[pair_idx]
+            url_a, url_b = pair_row["URL A"], pair_row["URL B"]
+
+            col_a, col_b = st.columns(2)
+
+            with st.spinner(f"Fetching pages…"):
+                page_a = fetch_page(url_a)
+                page_b = fetch_page(url_b)
+
+            # Check for errors
+            if "error" in page_a:
+                st.error(f"Failed to fetch **{url_a}**: {page_a['error']}")
+            if "error" in page_b:
+                st.error(f"Failed to fetch **{url_b}**: {page_b['error']}")
+
+            if "error" not in page_a and "error" not in page_b:
+                comparison = compare_pages(page_a, page_b)
+
+                # Similarity scores
+                s1, s2 = st.columns(2)
+                s1.metric("Content Similarity", f"{comparison['content_similarity']:.0%}")
+                s2.metric("Title Similarity", f"{comparison['title_similarity']:.0%}")
+
+                # Side-by-side page details
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    st.markdown(f"**Page A:** `{url_a}`")
+                    st.markdown(f"**Title:** {page_a['title']}")
+                    st.markdown(f"**Meta:** {page_a['meta_desc'][:200]}")
+                    st.markdown(f"**Word count:** {page_a['word_count']:,}")
+                    if page_a["headings"]["h1"]:
+                        st.markdown(f"**H1:** {', '.join(page_a['headings']['h1'])}")
+                    if page_a["headings"]["h2"]:
+                        st.markdown("**H2s:**")
+                        for h in page_a["headings"]["h2"]:
+                            st.markdown(f"- {h}")
+
+                with col_b:
+                    st.markdown(f"**Page B:** `{url_b}`")
+                    st.markdown(f"**Title:** {page_b['title']}")
+                    st.markdown(f"**Meta:** {page_b['meta_desc'][:200]}")
+                    st.markdown(f"**Word count:** {page_b['word_count']:,}")
+                    if page_b["headings"]["h1"]:
+                        st.markdown(f"**H1:** {', '.join(page_b['headings']['h1'])}")
+                    if page_b["headings"]["h2"]:
+                        st.markdown("**H2s:**")
+                        for h in page_b["headings"]["h2"]:
+                            st.markdown(f"- {h}")
+
+                # Shared analysis
+                st.divider()
+                if comparison["shared_keywords"]:
+                    st.markdown(
+                        f"**Shared top keywords ({len(comparison['shared_keywords'])}):** "
+                        + ", ".join(sorted(comparison["shared_keywords"]))
+                    )
+                else:
+                    st.markdown("**Shared top keywords:** None")
+
+                if comparison["shared_h2_exact"]:
+                    st.markdown(
+                        f"**Identical H2 headings ({len(comparison['shared_h2_exact'])}):** "
+                        + ", ".join(sorted(comparison["shared_h2_exact"]))
+                    )
+                if comparison["shared_h2_fuzzy"]:
+                    st.markdown(
+                        f"**Similar H2 headings ({len(comparison['shared_h2_fuzzy'])}):**"
+                    )
+                    for ha, hb in comparison["shared_h2_fuzzy"]:
+                        st.markdown(f'- "{ha}" ↔ "{hb}"')
+
+                # Verdict
+                st.divider()
+                cs = comparison["content_similarity"]
+                if cs >= 0.5:
+                    st.error(
+                        f"**High content overlap ({cs:.0%})** — these pages are likely "
+                        "cannibalizing each other. Consider merging or differentiating."
+                    )
+                elif cs >= 0.3:
+                    st.warning(
+                        f"**Moderate content overlap ({cs:.0%})** — some shared topics. "
+                        "Review the shared keywords and headings to decide."
+                    )
+                else:
+                    st.success(
+                        f"**Low content overlap ({cs:.0%})** — probably a false positive. "
+                        "Consider dismissing this pair."
+                    )
+    else:
+        st.info("No cannibalization pairs to deep dive into.")
 
 # --- Merge ---
 with tab_merge:
