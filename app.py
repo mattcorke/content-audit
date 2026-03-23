@@ -74,8 +74,10 @@ def fetch_page(url: str) -> dict:
     for tag in soup.find_all(STRIP_TAGS):
         tag.decompose()
 
-    # Remove Finder boilerplate divs (rewards banner, "ask a question", etc.)
+    # Remove Finder boilerplate divs (rewards banner, "ask a question", author bios)
     for tag in soup.find_all("div", class_="two-columns-content-boxes"):
+        tag.decompose()
+    for tag in soup.find_all("div", class_=lambda c: c and any(cls.startswith("authorBox") for cls in c)):
         tag.decompose()
 
     title = soup.title.get_text(strip=True) if soup.title else ""
