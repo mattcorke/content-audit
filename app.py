@@ -74,6 +74,10 @@ def fetch_page(url: str) -> dict:
     for tag in soup.find_all(STRIP_TAGS):
         tag.decompose()
 
+    # Remove Finder boilerplate divs (rewards banner, "ask a question", etc.)
+    for tag in soup.find_all("div", class_="two-columns-content-boxes"):
+        tag.decompose()
+
     title = soup.title.get_text(strip=True) if soup.title else ""
     meta_desc = ""
     meta_tag = soup.find("meta", attrs={"name": "description"})
