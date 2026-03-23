@@ -115,6 +115,69 @@ def fetch_page(url: str) -> dict:
     }
 
 
+def extract_ngrams(text: str, n: int) -> Counter:
+    """Extract word n-grams from text, filtering stopwords."""
+    stop = {"the", "and", "for", "that", "this", "with", "are", "from", "was",
+            "were", "been", "have", "has", "had", "not", "but", "can", "will",
+            "your", "you", "our", "all", "more", "about", "also", "into", "than",
+            "its", "which", "their", "them", "other", "some", "what", "when",
+            "how", "who", "may", "most", "any", "each", "only", "over", "such"}
+    words = re.findall(r"[a-zA-Z]{3,}", text.lower())
+    words = [w for w in words if w not in stop]
+    grams = [" ".join(words[i:i + n]) for i in range(len(words) - n + 1)]
+    return Counter(grams)
+
+
+def split_paragraphs(text: str, min_words: int = 20) -> list[str]:
+    """Split body text into paragraph-like chunks by sentence boundaries."""
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+    chunks = []
+    current = []
+    for s in sentences:
+        current.append(s)
+        if len(" ".join(current).split()) >= min_words:
+            chunks.append(" ".join(current))
+            current = []
+    if current:
+        last = " ".join(current)
+        if len(last.split()) >= min_words // 2:
+            chunks.append(last)
+        elif chunks:
+            chunks[-1] += " " + last
+    return chunks
+
+
+def find_similar_paragraphs(
+    page_a: dict, page_b: dict, top_n: int = 5, min_sim: float = 0.3
+) -> list[dict]:
+    """Find the most similar paragraph pairs between two pages."""
+    paras_a = split_paragraphs(page_a["body_text"])
+    paras_b = split_paragraphs(page_b["body_text"])
+
+    if not paras_a or not paras_b:
+        return []
+
+    all_paras = paras_a + paras_b
+    vec = TfidfVectorizer(stop_words="english", max_features=5000)
+    tfidf = vec.fit_transform(all_paras)
+
+    sim_matrix = cosine_similarity(tfidf[:len(paras_a)], tfidf[len(paras_a):])
+
+    pairs = []
+    for i in range(len(paras_a)):
+        for j in range(len(paras_b)):
+            score = sim_matrix[i][j]
+            if score >= min_sim:
+                pairs.append({
+                    "para_a": paras_a[i],
+                    "para_b": paras_b[j],
+                    "similarity": round(float(score), 3),
+                })
+
+    pairs.sort(key=lambda x: x["similarity"], reverse=True)
+    return pairs[:top_n]
+
+
 def compare_pages(page_a: dict, page_b: dict) -> dict:
     """Compare two fetched pages and return similarity metrics."""
     if "error" in page_a or "error" in page_b:
@@ -137,6 +200,42 @@ def compare_pages(page_a: dict, page_b: dict) -> dict:
     kw_b = {kw for kw, _ in page_b["top_keywords"]}
     shared_kw = kw_a & kw_b
 
+    # Shared phrases (bigrams and trigrams)
+    bi_a = extract_ngrams(page_a["body_text"], 2)
+    bi_b = extract_ngrams(page_b["body_text"], 2)
+    tri_a = extract_ngrams(page_a["body_text"], 3)
+    tri_b = extract_ngrams(page_b["body_text"], 3)
+
+    shared_bigrams = set(bi_a.keys()) & set(bi_b.keys())
+    shared_trigrams = set(tri_a.keys()) & set(tri_b.keys())
+
+    # Rank shared phrases by combined frequency
+    shared_bigrams_ranked = sorted(
+        shared_bigrams, key=lambda p: bi_a[p] + bi_b[p], reverse=True
+    )[:15]
+    shared_trigrams_ranked = sorted(
+        shared_trigrams, key=lambda p: tri_a[p] + tri_b[p], reverse=True
+    )[:15]
+
+    # Top unique terms per page (high TF-IDF in one, absent/low in the other)
+    unique_a = []
+    unique_b = []
+    if all(t.strip() for t in texts):
+        uvec = TfidfVectorizer(stop_words="english", max_features=3000, ngram_range=(1, 2))
+        utfidf = uvec.fit_transform(texts)
+        feature_names = uvec.get_feature_names_out()
+        scores_a = utfidf[0].toarray().flatten()
+        scores_b = utfidf[1].toarray().flatten()
+        diff_a = scores_a - scores_b
+        diff_b = scores_b - scores_a
+        top_a_idx = diff_a.argsort()[-15:][::-1]
+        top_b_idx = diff_b.argsort()[-15:][::-1]
+        unique_a = [(feature_names[i], round(float(diff_a[i]), 3)) for i in top_a_idx if diff_a[i] > 0.01]
+        unique_b = [(feature_names[i], round(float(diff_b[i]), 3)) for i in top_b_idx if diff_b[i] > 0.01]
+
+    # Similar paragraphs
+    similar_paras = find_similar_paragraphs(page_a, page_b)
+
     # Shared headings (H2s — most indicative of subtopic overlap)
     h2_a = {h.lower().strip() for h in page_a["headings"].get("h2", [])}
     h2_b = {h.lower().strip() for h in page_b["headings"].get("h2", [])}
@@ -152,6 +251,11 @@ def compare_pages(page_a: dict, page_b: dict) -> dict:
         "content_similarity": round(content_sim, 3),
         "title_similarity": round(title_sim, 3),
         "shared_keywords": shared_kw,
+        "shared_bigrams": shared_bigrams_ranked,
+        "shared_trigrams": shared_trigrams_ranked,
+        "unique_terms_a": unique_a,
+        "unique_terms_b": unique_b,
+        "similar_paragraphs": similar_paras,
         "shared_h2_exact": shared_h2,
         "shared_h2_fuzzy": fuzzy_h2,
     }
@@ -897,15 +1001,31 @@ with tab_cannibal:
                             for h in page_b["headings"]["h2"]:
                                 st.markdown(f"- {h}")
 
-                    # Shared analysis
+                    # --- Shared phrases ---
                     st.divider()
+                    st.markdown("#### Shared Phrases")
+
                     if comparison["shared_keywords"]:
                         st.markdown(
-                            f"**Shared top keywords ({len(comparison['shared_keywords'])}):** "
+                            f"**Shared keywords ({len(comparison['shared_keywords'])}):** "
                             + ", ".join(sorted(comparison["shared_keywords"]))
                         )
-                    else:
-                        st.markdown("**Shared top keywords:** None")
+
+                    ph_col1, ph_col2 = st.columns(2)
+                    with ph_col1:
+                        if comparison["shared_bigrams"]:
+                            st.markdown(f"**Shared 2-word phrases ({len(comparison['shared_bigrams'])}):**")
+                            for phrase in comparison["shared_bigrams"]:
+                                st.markdown(f"- {phrase}")
+                        else:
+                            st.markdown("**Shared 2-word phrases:** None")
+                    with ph_col2:
+                        if comparison["shared_trigrams"]:
+                            st.markdown(f"**Shared 3-word phrases ({len(comparison['shared_trigrams'])}):**")
+                            for phrase in comparison["shared_trigrams"]:
+                                st.markdown(f"- {phrase}")
+                        else:
+                            st.markdown("**Shared 3-word phrases:** None")
 
                     if comparison["shared_h2_exact"]:
                         st.markdown(
@@ -919,22 +1039,66 @@ with tab_cannibal:
                         for ha, hb in comparison["shared_h2_fuzzy"]:
                             st.markdown(f'- "{ha}" ↔ "{hb}"')
 
+                    # --- Unique terms ---
+                    st.divider()
+                    st.markdown("#### What Makes Each Page Unique")
+
+                    uniq_col_a, uniq_col_b = st.columns(2)
+                    with uniq_col_a:
+                        st.markdown(f"**Unique to Page A:**")
+                        if comparison["unique_terms_a"]:
+                            for term, score in comparison["unique_terms_a"][:10]:
+                                st.markdown(f"- {term}")
+                        else:
+                            st.markdown("_No distinguishing terms found_")
+                    with uniq_col_b:
+                        st.markdown(f"**Unique to Page B:**")
+                        if comparison["unique_terms_b"]:
+                            for term, score in comparison["unique_terms_b"][:10]:
+                                st.markdown(f"- {term}")
+                        else:
+                            st.markdown("_No distinguishing terms found_")
+
+                    # --- Similar paragraphs ---
+                    st.divider()
+                    st.markdown("#### Most Similar Passages")
+                    if comparison["similar_paragraphs"]:
+                        st.caption(
+                            "These are the passages with the highest content overlap "
+                            "between the two pages — the strongest evidence of cannibalization."
+                        )
+                        for k, para_pair in enumerate(comparison["similar_paragraphs"]):
+                            st.markdown(f"**Match {k + 1}** — similarity: `{para_pair['similarity']:.0%}`")
+                            p_col_a, p_col_b = st.columns(2)
+                            with p_col_a:
+                                st.info(para_pair["para_a"][:500])
+                            with p_col_b:
+                                st.info(para_pair["para_b"][:500])
+                    else:
+                        st.success("No significantly similar passages found.")
+
                     # Verdict
                     st.divider()
                     cs = comparison["content_similarity"]
-                    if cs >= 0.5:
+                    n_shared_phrases = len(comparison["shared_bigrams"]) + len(comparison["shared_trigrams"])
+                    n_similar_paras = len(comparison["similar_paragraphs"])
+
+                    if cs >= 0.5 or (n_similar_paras >= 3 and n_shared_phrases >= 10):
                         st.error(
-                            f"**High content overlap ({cs:.0%})** — these pages are likely "
+                            f"**High content overlap ({cs:.0%})** — {n_shared_phrases} shared phrases, "
+                            f"{n_similar_paras} similar passages. These pages are likely "
                             "cannibalizing each other. Consider merging or differentiating."
                         )
-                    elif cs >= 0.3:
+                    elif cs >= 0.3 or (n_similar_paras >= 1 and n_shared_phrases >= 5):
                         st.warning(
-                            f"**Moderate content overlap ({cs:.0%})** — some shared topics. "
-                            "Review the shared keywords and headings to decide."
+                            f"**Moderate content overlap ({cs:.0%})** — {n_shared_phrases} shared phrases, "
+                            f"{n_similar_paras} similar passages. "
+                            "Review the shared content to decide."
                         )
                     else:
                         st.success(
-                            f"**Low content overlap ({cs:.0%})** — probably a false positive. "
+                            f"**Low content overlap ({cs:.0%})** — {n_shared_phrases} shared phrases, "
+                            f"{n_similar_paras} similar passages. Probably a false positive. "
                             "Consider dismissing this pair."
                         )
 
