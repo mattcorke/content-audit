@@ -2,3 +2,4 @@
 __pycache__/
 *.pyc
 .streamlit/
+dismissed_pairs.json

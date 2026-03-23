@@ -3,12 +3,41 @@ import pandas as pd
 import numpy as np
 from urllib.parse import urlparse
 import re
+import json
+from pathlib import Path
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from rapidfuzz import fuzz
 import plotly.express as px
 import plotly.graph_objects as go
 from io import BytesIO
+
+# ---------------------------------------------------------------------------
+# Dismissals persistence
+# ---------------------------------------------------------------------------
+
+DISMISSALS_FILE = Path(__file__).parent / "dismissed_pairs.json"
+
+
+def load_dismissed_pairs() -> set[tuple[str, str]]:
+    """Load dismissed URL pairs from disk."""
+    if not DISMISSALS_FILE.exists():
+        return set()
+    try:
+        data = json.loads(DISMISSALS_FILE.read_text())
+        return {(p[0], p[1]) for p in data}
+    except (json.JSONDecodeError, KeyError):
+        return set()
+
+
+def save_dismissed_pairs(pairs: set[tuple[str, str]]) -> None:
+    """Save dismissed URL pairs to disk."""
+    DISMISSALS_FILE.write_text(json.dumps(sorted(pairs), indent=2))
+
+
+def make_pair_key(url_a: str, url_b: str) -> tuple[str, str]:
+    """Canonical key for a URL pair (sorted so order doesn't matter)."""
+    return tuple(sorted([url_a, url_b]))
 
 st.set_page_config(
     page_title="Content Audit Tool",
@@ -645,8 +674,50 @@ with tab_cannibal:
     if cannibal_df.empty:
         st.success("No cannibalization detected at this threshold.")
     else:
-        st.warning(f"Found **{len(cannibal_df):,}** potential cannibalization pairs.")
-        st.dataframe(cannibal_df, use_container_width=True, height=500)
+        # Filter out dismissed pairs
+        dismissed = load_dismissed_pairs()
+        if dismissed:
+            keep_mask = cannibal_df.apply(
+                lambda r: make_pair_key(r["URL A"], r["URL B"]) not in dismissed,
+                axis=1,
+            )
+            hidden_count = (~keep_mask).sum()
+            cannibal_df = cannibal_df[keep_mask].reset_index(drop=True)
+        else:
+            hidden_count = 0
+
+        if cannibal_df.empty:
+            st.success("All pairs have been dismissed.")
+        else:
+            count_msg = f"Found **{len(cannibal_df):,}** potential cannibalization pairs."
+            if hidden_count:
+                count_msg += f" ({hidden_count} dismissed pairs hidden)"
+            st.warning(count_msg)
+
+            # Add dismiss checkbox column
+            cannibal_df.insert(0, "Dismiss", False)
+            edited = st.data_editor(
+                cannibal_df,
+                use_container_width=True,
+                height=500,
+                key="cannibal_editor",
+                column_config={"Dismiss": st.column_config.CheckboxColumn("Dismiss", default=False)},
+            )
+
+            to_dismiss = edited[edited["Dismiss"] == True]
+            if len(to_dismiss) > 0:
+                if st.button(f"Dismiss {len(to_dismiss)} selected pair(s)", type="primary"):
+                    new_dismissed = dismissed.copy()
+                    for _, row in to_dismiss.iterrows():
+                        new_dismissed.add(make_pair_key(row["URL A"], row["URL B"]))
+                    save_dismissed_pairs(new_dismissed)
+                    st.rerun()
+
+        # Restore dismissed pairs button
+        if hidden_count > 0:
+            if st.button(f"Restore {hidden_count} dismissed pair(s)"):
+                save_dismissed_pairs(set())
+                st.rerun()
 
 # --- Merge ---
 with tab_merge:
